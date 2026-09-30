@@ -204,26 +204,10 @@ async def cmd_stats(message: Message):
     if message.from_user.id not in OPERATOR_IDS:
         return
 
-    total_channels = db.count_channels()
-    with_caption = db.count_channels_with_caption()
-    by_mode = db.count_channels_by_mode()
-
-    mode_lines = "\n".join(
-        f"   {TRANSLIT_MODES[key][0]}: {by_mode.get(key, 0)}"
-        for key in TRANSLIT_MODES
-    )
-
     text = (
         "📊 <b>Bot statistikasi</b>\n\n"
-        f"👥 Foydalanuvchilar (kanal egalari): {db.count_owners()}\n"
-        f"📢 Jami kanallar: {total_channels}\n"
-        f"   ✅ Izoh sozlangan: {with_caption}\n"
-        f"   — Izoh sozlanmagan: {total_channels - with_caption}\n\n"
-        f"🔤 O'girish rejimi bo'yicha:\n{mode_lines}\n\n"
-        f"🖼 Avtomatik qo'shilgan izohlar:\n"
-        f"   Bugun (so'nggi 24 soat): {db.count_captions_applied(since_hours=24)}\n"
-        f"   So'nggi 7 kun: {db.count_captions_applied(since_hours=24 * 7)}\n"
-        f"   Jami: {db.count_captions_applied()}"
+        f"👥 Foydalanuvchilar: {db.count_owners()}\n"
+        f"📢 Ulangan kanallar: {db.count_channels()}"
     )
     await message.answer(text)
 
