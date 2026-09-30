@@ -21,6 +21,8 @@ import re
 # oddiy apostrofni ’ yoki ‘ kabi "aylanma" belgiga avtokorrektsiya qiladi —
 # shu variantlar ham albatta shu ro'yxatda bo'lishi kerak)
 _APOSTROPHES = "ʻʼ'`´ʹ’‘"
+# Tez (O(1)) tekshirish uchun set — satr ichida qidirishdan tezroq
+_APOSTROPHES_SET = frozenset(_APOSTROPHES)
 
 _LATIN_TO_CYR_SINGLE = {
     "a": "а", "b": "б", "d": "д", "e": "е", "f": "ф", "g": "г", "h": "ҳ",
@@ -29,11 +31,15 @@ _LATIN_TO_CYR_SINGLE = {
     "x": "х", "y": "й", "z": "з",
 }
 
-# Ikki harfli birikmalar (uzunroq mos kelishi birinchi tekshiriladi)
-_LAT_DIGRAPHS = [
-    ("yo", "ё"), ("yu", "ю"), ("ya", "я"), ("ye", "е"),
-    ("sh", "ш"), ("ch", "ч"), ("ts", "ц"),
-]
+# Ikki harfli birikmalar — dict sifatida, har bir harf uchun ro'yxatni
+# ketma-ket aylanish o'rniga bitta O(1) qidiruv qilish uchun
+_LAT_DIGRAPH_MAP = {
+    "yo": "ё", "yu": "ю", "ya": "я", "ye": "е",
+    "sh": "ш", "ch": "ч", "ts": "ц",
+}
+
+_OG_LOWER = frozenset(("o", "g"))
+_OG_TO_CYR = {"o": "ў", "g": "ғ"}
 
 # Lotin so'z (harflar va ular orasidagi apostrof, masalan "bo'ylab").
 # Oxirgi qismdagi yakka apostrof ham ushlanadi — masalan "bog'", "tog'",
@@ -64,40 +70,37 @@ def _latin_to_cyr_word(word: str) -> str:
     n = len(word)
     while i < n:
         c = word[i]
+        lc = c.lower()  # bir marta hisoblab, qayta ishlatamiz
 
         # o' / g'  ->  ў / ғ
-        if c.lower() in ("o", "g") and i + 1 < n and word[i + 1] in _APOSTROPHES:
-            cyr = "ў" if c.lower() == "o" else "ғ"
-            out.append(_cased(c, cyr))
+        if lc in _OG_LOWER and i + 1 < n and word[i + 1] in _APOSTROPHES_SET:
+            out.append(_cased(c, _OG_TO_CYR[lc]))
             i += 2
             continue
 
-        # sh, ch, ts, yo, yu, ya, ye
-        two = word[i:i + 2].lower()
-        matched = False
-        for lat, cyr in _LAT_DIGRAPHS:
-            if two == lat:
-                out.append(_cased(c, cyr))
+        # sh, ch, ts, yo, yu, ya, ye — bitta O(1) dict qidiruvi
+        if i + 1 < n:
+            cyr2 = _LAT_DIGRAPH_MAP.get(lc + word[i + 1].lower())
+            if cyr2 is not None:
+                out.append(_cased(c, cyr2))
                 i += 2
-                matched = True
-                break
-        if matched:
-            continue
+                continue
 
         # so'z boshidagi "e" -> "э" (masalan "elon" -> "элон")
-        if c.lower() == "e" and i == 0:
+        if lc == "e" and i == 0:
             out.append(_cased(c, "э"))
             i += 1
             continue
 
-        if c.lower() in _LATIN_TO_CYR_SINGLE:
-            out.append(_cased(c, _LATIN_TO_CYR_SINGLE[c.lower()]))
+        cyr1 = _LATIN_TO_CYR_SINGLE.get(lc)
+        if cyr1 is not None:
+            out.append(_cased(c, cyr1))
             i += 1
             continue
 
         # o'/g' bilan band bo'lmagan, ammo so'z ichida qolgan apostrof
         # (masalan "ta'sir", "san'at") -> tutuq belgisi
-        if c in _APOSTROPHES:
+        if c in _APOSTROPHES_SET:
             out.append("ъ")
             i += 1
             continue
