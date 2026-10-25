@@ -1,11 +1,25 @@
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 # Railway'da bu Volume mount qilingan doimiy papkaga ko'rsatilishi kerak
-# (masalan /data/captions.db), aks holda har deploy'da ma'lumot o'chib ketadi.
+# (masalan DB_PATH=/data/captions.db), aks holda har deploy'da ma'lumot o'chadi.
 DB_PATH = os.getenv("DB_PATH", "captions.db")
+
+LOG_KEEP_DAYS = 90
+
+
+@contextmanager
+def _conn() -> Iterator[sqlite3.Connection]:
+    """Xatolik bo'lsa ham ulanish yopiladi; muvaffaqiyatda commit qilinadi."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _column_exists(cur: sqlite3.Cursor, table: str, column: str) -> bool:
@@ -17,253 +31,292 @@ def init_db() -> None:
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS channels (
-            channel_id INTEGER PRIMARY KEY,
-            title TEXT,
-            owner_id INTEGER
+    if not db_dir:
+        # Volume yo'q bo'lishi mumkin — foydalanuvchiga eslatma uchun
+        import logging
+        logging.getLogger(__name__).warning(
+            "DB_PATH='%s' — doimiy Volume emas. Railway'da DB_PATH=/data/captions.db "
+            "qo'ying, aks holda har deploy'da ma'lumot o'chadi.", DB_PATH
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS captions (
-            channel_id INTEGER PRIMARY KEY,
-            caption TEXT
+    with _conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id INTEGER PRIMARY KEY,
+                title TEXT,
+                owner_id INTEGER,
+                translit_mode TEXT DEFAULT 'off',
+                active INTEGER DEFAULT 1,
+                paused INTEGER DEFAULT 0,
+                caption_pos TEXT DEFAULT 'after'
+            )
+            """
         )
-        """
-    )
-    # Eski (bitta kanalli) versiyadan qolgan jadval — migratsiya uchun kerak
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS captions (
+                channel_id INTEGER PRIMARY KEY,
+                caption TEXT
+            )
+            """
         )
-        """
-    )
-    # Har bir muvaffaqiyatli avtomatik izoh qo'shilganda bitta yozuv —
-    # statistika (/stats) uchun.
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS caption_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel_id INTEGER,
-            ts TEXT
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
         )
-        """
-    )
-    # Eski (omma uchun ochilishidan oldingi) bazalarda "channels" jadvalida
-    # owner_id ustuni bo'lmasligi mumkin — uni qo'shib qo'yamiz.
-    if not _column_exists(cur, "channels", "owner_id"):
-        cur.execute("ALTER TABLE channels ADD COLUMN owner_id INTEGER")
-    # Har bir kanal uchun o'girish yo'nalishi (lotin->kirill / kirill->lotin
-    # / o'chirilgan). SQLite ALTER TABLE ... DEFAULT eski qatorlarga ham
-    # avtomatik shu qiymatni beradi.
-    if not _column_exists(cur, "channels", "translit_mode"):
-        cur.execute("ALTER TABLE channels ADD COLUMN translit_mode TEXT DEFAULT 'l2c'")
-    conn.commit()
-    conn.close()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS caption_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER,
+                ts TEXT
+            )
+            """
+        )
+        # Eski bazalar uchun migratsiyalar
+        if not _column_exists(cur, "channels", "owner_id"):
+            cur.execute("ALTER TABLE channels ADD COLUMN owner_id INTEGER")
+        if not _column_exists(cur, "channels", "translit_mode"):
+            # Eski kanallar avvalgi xulq (l2c) bilan qoladi
+            cur.execute("ALTER TABLE channels ADD COLUMN translit_mode TEXT DEFAULT 'l2c'")
+        if not _column_exists(cur, "channels", "active"):
+            cur.execute("ALTER TABLE channels ADD COLUMN active INTEGER DEFAULT 1")
+        if not _column_exists(cur, "channels", "paused"):
+            cur.execute("ALTER TABLE channels ADD COLUMN paused INTEGER DEFAULT 0")
+        if not _column_exists(cur, "channels", "caption_pos"):
+            cur.execute("ALTER TABLE channels ADD COLUMN caption_pos TEXT DEFAULT 'after'")
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_caption_log_ts ON caption_log(ts)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_channels_owner ON channels(owner_id)")
+        # Jurnal cheksiz o'smasligi uchun eskilarini tozalaymiz
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=LOG_KEEP_DAYS)).isoformat()
+        cur.execute("DELETE FROM caption_log WHERE ts < ?", (cutoff,))
 
 
 def migrate_legacy_caption(channel_id: Optional[int]) -> None:
-    """Eski bir-kanalli versiyada saqlangan izohni shu kanal uchun ko'chiradi (bir martalik)."""
     if not channel_id:
         return
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = 'caption'")
-    row = cur.fetchone()
-    if row and row[0]:
-        cur.execute(
-            "INSERT INTO captions (channel_id, caption) VALUES (?, ?) "
-            "ON CONFLICT(channel_id) DO NOTHING",
-            (channel_id, row[0]),
-        )
-        conn.commit()
-    conn.close()
+    with _conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key = 'caption'")
+        row = cur.fetchone()
+        if row and row[0]:
+            cur.execute(
+                "INSERT INTO captions (channel_id, caption) VALUES (?, ?) "
+                "ON CONFLICT(channel_id) DO NOTHING",
+                (channel_id, row[0]),
+            )
 
 
 def assign_default_owner(default_owner_id: Optional[int]) -> None:
-    """Omma uchun ochilishidan oldin ro'yxatga olingan, egasi noma'lum
-    (owner_id = NULL) kanallarni berilgan foydalanuvchiga bog'laydi
-    (bir martalik migratsiya, botning ilk operatoriga)."""
     if not default_owner_id:
         return
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE channels SET owner_id = ? WHERE owner_id IS NULL",
-        (default_owner_id,),
-    )
-    conn.commit()
-    conn.close()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE channels SET owner_id = ? WHERE owner_id IS NULL",
+            (default_owner_id,),
+        )
 
 
-def register_channel(channel_id: int, title: str, owner_id: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO channels (channel_id, title, owner_id) VALUES (?, ?, ?) "
-        "ON CONFLICT(channel_id) DO UPDATE SET title = excluded.title, owner_id = excluded.owner_id",
-        (channel_id, title, owner_id),
-    )
-    conn.commit()
-    conn.close()
+def register_channel(channel_id: int, title: str, owner_id: int) -> bool:
+    """Kanalni ro'yxatga oladi. MAVJUD egani ALMASHTIRMAYDI (boshqa admin
+    bot huquqini o'zgartirsa ham kanal unga o'tib ketmasin). Faqat ega
+    noma'lum (NULL) bo'lsa biriktiriladi. Kanal qayta faollashtiriladi.
+    True — yangi yozuv yaratildi."""
+    with _conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM channels WHERE channel_id = ?", (channel_id,))
+        existed = cur.fetchone() is not None
+        cur.execute(
+            "INSERT INTO channels (channel_id, title, owner_id, active) VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(channel_id) DO UPDATE SET "
+            "title = excluded.title, "
+            "owner_id = COALESCE(channels.owner_id, excluded.owner_id), "
+            "active = 1",
+            (channel_id, title, owner_id),
+        )
+        return not existed
 
 
-def remove_channel(channel_id: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
-    cur.execute("DELETE FROM captions WHERE channel_id = ?", (channel_id,))
-    conn.commit()
-    conn.close()
+def deactivate_channel(channel_id: int) -> None:
+    """Bot adminlikdan tushganda sozlamalar (izoh, rejim) saqlanib qoladi —
+    qayta qo'shilganda hammasini boshidan kiritish shart emas."""
+    with _conn() as conn:
+        conn.execute("UPDATE channels SET active = 0 WHERE channel_id = ?", (channel_id,))
+
+
+# Eski nom bilan moslik
+remove_channel = deactivate_channel
+
+
+def is_active(channel_id: int) -> bool:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(active, 1) FROM channels WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+    return bool(row and row[0])
 
 
 def list_channels_for_owner(owner_id: int) -> List[Tuple[int, str]]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT channel_id, title FROM channels WHERE owner_id = ? ORDER BY title",
-        (owner_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT channel_id, COALESCE(title, channel_id) FROM channels "
+            "WHERE owner_id = ? AND COALESCE(active, 1) = 1 ORDER BY title",
+            (owner_id,),
+        ).fetchall()
 
 
 def get_channel_title(channel_id: int) -> Optional[str]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT title FROM channels WHERE channel_id = ?", (channel_id,))
-    row = cur.fetchone()
-    conn.close()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT title FROM channels WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
     return row[0] if row else None
 
 
 def get_translit_mode(channel_id: int) -> str:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT translit_mode FROM channels WHERE channel_id = ?", (channel_id,))
-    row = cur.fetchone()
-    conn.close()
-    return (row[0] if row and row[0] else "l2c")
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT translit_mode FROM channels WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+    return row[0] if row and row[0] else "off"
 
 
 def set_translit_mode(channel_id: int, mode: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE channels SET translit_mode = ? WHERE channel_id = ?",
-        (mode, channel_id),
-    )
-    conn.commit()
-    conn.close()
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE channels SET translit_mode = ? WHERE channel_id = ?",
+            (mode, channel_id),
+        )
+
+
+def get_paused(channel_id: int) -> bool:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(paused, 0) FROM channels WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+    return bool(row and row[0])
+
+
+def set_paused(channel_id: int, paused: bool) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE channels SET paused = ? WHERE channel_id = ?",
+            (1 if paused else 0, channel_id),
+        )
+
+
+def get_caption_pos(channel_id: int) -> str:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT caption_pos FROM channels WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+    return row[0] if row and row[0] in ("before", "after") else "after"
+
+
+def set_caption_pos(channel_id: int, pos: str) -> None:
+    if pos not in ("before", "after"):
+        return
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE channels SET caption_pos = ? WHERE channel_id = ?", (pos, channel_id)
+        )
 
 
 def get_channel_owner(channel_id: int) -> Optional[int]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT owner_id FROM channels WHERE channel_id = ?", (channel_id,))
-    row = cur.fetchone()
-    conn.close()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT owner_id FROM channels WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
     return row[0] if row else None
 
 
 def count_channels() -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM channels")
-    row = cur.fetchone()
-    conn.close()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM channels WHERE COALESCE(active, 1) = 1"
+        ).fetchone()
     return row[0] if row else 0
 
 
 def count_owners() -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(DISTINCT owner_id) FROM channels WHERE owner_id IS NOT NULL")
-    row = cur.fetchone()
-    conn.close()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT owner_id) FROM channels "
+            "WHERE owner_id IS NOT NULL AND COALESCE(active, 1) = 1"
+        ).fetchone()
     return row[0] if row else 0
 
 
 def count_channels_with_caption() -> int:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COUNT(*) FROM captions WHERE caption IS NOT NULL AND caption != ''"
-    )
-    row = cur.fetchone()
-    conn.close()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM captions c JOIN channels ch ON ch.channel_id = c.channel_id "
+            "WHERE c.caption IS NOT NULL AND c.caption != '' AND COALESCE(ch.active, 1) = 1"
+        ).fetchone()
     return row[0] if row else 0
 
 
 def count_channels_by_mode() -> Dict[str, int]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT COALESCE(translit_mode, 'l2c'), COUNT(*) FROM channels GROUP BY 1"
-    )
-    rows = cur.fetchall()
-    conn.close()
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT COALESCE(translit_mode, 'off'), COUNT(*) FROM channels "
+            "WHERE COALESCE(active, 1) = 1 GROUP BY 1"
+        ).fetchall()
     return {mode: count for mode, count in rows}
 
 
 def log_caption_applied(channel_id: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO caption_log (channel_id, ts) VALUES (?, ?)",
-        (channel_id, datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO caption_log (channel_id, ts) VALUES (?, ?)",
+            (channel_id, datetime.now(timezone.utc).isoformat()),
+        )
 
 
-def count_captions_applied(since_hours: Optional[int] = None) -> int:
-    """Jami (yoki so'nggi N soatda) muvaffaqiyatli qo'shilgan avtomatik
-    izohlar soni."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    if since_hours is None:
-        cur.execute("SELECT COUNT(*) FROM caption_log")
-    else:
+def count_captions_applied(
+    since_hours: Optional[int] = None, channel_id: Optional[int] = None
+) -> int:
+    """Jami (yoki so'nggi N soatda, yoki bitta kanal bo'yicha) qo'shilgan
+    avtomatik izohlar soni."""
+    query = "SELECT COUNT(*) FROM caption_log WHERE 1=1"
+    params: list = []
+    if since_hours is not None:
         since = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).isoformat()
-        cur.execute("SELECT COUNT(*) FROM caption_log WHERE ts >= ?", (since,))
-    row = cur.fetchone()
-    conn.close()
+        query += " AND ts >= ?"
+        params.append(since)
+    if channel_id is not None:
+        query += " AND channel_id = ?"
+        params.append(channel_id)
+    with _conn() as conn:
+        row = conn.execute(query, params).fetchone()
     return row[0] if row else 0
 
 
 def get_caption(channel_id: int) -> Optional[str]:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT caption FROM captions WHERE channel_id = ?", (channel_id,))
-    row = cur.fetchone()
-    conn.close()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT caption FROM captions WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
     return row[0] if row else None
 
 
 def set_caption(channel_id: int, text: str) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO captions (channel_id, caption) VALUES (?, ?) "
-        "ON CONFLICT(channel_id) DO UPDATE SET caption = excluded.caption",
-        (channel_id, text),
-    )
-    conn.commit()
-    conn.close()
+    """Izohning ASL (o'girilmagan) HTML matni saqlanadi — o'girish postga
+    qo'shilayotganda kanalning joriy rejimi bo'yicha bajariladi."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO captions (channel_id, caption) VALUES (?, ?) "
+            "ON CONFLICT(channel_id) DO UPDATE SET caption = excluded.caption",
+            (channel_id, text),
+        )
 
 
 def clear_caption(channel_id: int) -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM captions WHERE channel_id = ?", (channel_id,))
-    conn.commit()
-    conn.close()
+    with _conn() as conn:
+        conn.execute("DELETE FROM captions WHERE channel_id = ?", (channel_id,))

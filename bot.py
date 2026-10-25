@@ -1,10 +1,12 @@
 import asyncio
+import html as html_lib
 import logging
 import re
+import time
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,15 +28,23 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 
-MAX_CAPTION_LEN = 1024  # Telegramning video/rasm caption limiti
+MAX_CAPTION_LEN = 1024  # Telegramning media caption limiti (teglarsiz belgilar)
+MAX_MESSAGE_LEN = 4096  # oddiy xabar limiti
 ALBUM_DEBOUNCE = 1.5  # soniya — albomning barcha elementlari kelishini kutamiz
+NOTIFY_COOLDOWN = 3600  # bir kanal bo'yicha xato xabarini soatiga bir martadan ko'p yubormaymiz
+SKIP_TAG_RE = re.compile(r"#izohsiz\b", re.I)
+
+# Izoh qo'shiladigan media turlari
+MEDIA_FILTER = F.video | F.photo | F.document | F.animation | F.audio
 
 album_messages: dict[str, list[Message]] = {}
 album_tasks: dict[str, asyncio.Task] = {}
+album_done: dict[str, float] = {}
+_last_notified: dict[int, float] = {}
 
 WELCOME_TEXT = (
     "Salom! 👋\n\n"
-    "Men kanalga tashlangan video/rasmlarga <b>siz belgilagan izohni avtomatik "
+    "Men kanalga tashlangan video/rasm/fayllarga <b>siz belgilagan izohni avtomatik "
     "qo'shib boruvchi</b> botman. Lotin va kirill orasida avtomatik o'girish "
     "imkoniyati ham bor.\n\n"
     "<b>Qanday ishlatiladi:</b>\n"
@@ -43,16 +53,31 @@ WELCOME_TEXT = (
     "ni yoqing.\n"
     "3. Shu yerga (shaxsiy chatga) qaytib, /setcaption buyrug'i bilan izoh matnini "
     "kiriting.\n\n"
-    "Shundan keyin o'sha kanalga tashlangan har bir yangi video, rasm yoki "
+    "Shundan keyin o'sha kanalga tashlangan har bir yangi video, rasm, GIF, fayl yoki "
     "albomga izohingiz avtomatik qo'shiladi. Har kim faqat o'zi qo'shgan "
     "kanal(lar)ni boshqaradi — boshqalarnikiga kirolmaydi.\n\n"
     "<b>Buyruqlar:</b>\n"
     "/setcaption — kanal tanlab, izoh belgilash\n"
     "/caption — bir kanalning joriy izohini ko'rish\n"
     "/clearcaption — bir kanal uchun avtomatik izohni to'xtatish\n"
+    "/pause — izohni vaqtincha o'chirish/yoqish (izoh saqlanadi)\n"
+    "/position — izoh post matnidan oldin yoki keyin turishi\n"
     "/translit — kanal uchun lotin↔kirill o'girish yo'nalishini tanlash\n"
-    "/channels — sizga tegishli kanallar ro'yxati"
+    "/channels — sizga tegishli kanallar ro'yxati\n\n"
+    "💡 Post matniga <code>#izohsiz</code> yozsangiz, o'sha postga izoh qo'shilmaydi "
+    "(belgi o'zi o'chiriladi).\n"
+    "💡 Botga to'g'ridan-to'g'ri matn yozsangiz, uni lotin↔kirill o'girib beraman."
 )
+
+
+def esc(s) -> str:
+    return html_lib.escape(str(s), quote=False)
+
+
+def plain_len(html_text: str) -> int:
+    """Telegram limiti teglarsiz (entity'lar hisobga olinmagan) belgilar
+    bo'yicha hisoblanadi."""
+    return len(html_lib.unescape(re.sub(r"<[^>]+>", "", html_text)))
 
 
 def channels_keyboard(prefix: str, owner_id: int) -> InlineKeyboardMarkup:
@@ -72,7 +97,37 @@ async def _no_channels_message(message: Message) -> None:
     )
 
 
-# ---------- Majburiy obuna (@namanganliklar_uz) ----------
+async def _owned_channel(callback: CallbackQuery, part: int = 1):
+    """callback_data'dan kanal ID'ni oladi va egalikni tekshiradi.
+    Muvaffaqiyatda (channel_id, title) qaytaradi, aks holda None."""
+    try:
+        channel_id = int(callback.data.split(":")[part])
+    except (ValueError, IndexError):
+        await callback.answer("Noto'g'ri tugma.", show_alert=True)
+        return None
+    if db.get_channel_owner(channel_id) != callback.from_user.id:
+        await callback.answer("Bu kanal sizga tegishli emas.", show_alert=True)
+        return None
+    title = db.get_channel_title(channel_id) or str(channel_id)
+    return channel_id, title
+
+
+async def notify_owner(channel_id: int, text: str) -> None:
+    """Kanal egasiga shaxsiy xabar (soatiga ko'pi bilan bir marta)."""
+    now = time.monotonic()
+    if now - _last_notified.get(channel_id, -NOTIFY_COOLDOWN) < NOTIFY_COOLDOWN:
+        return
+    owner_id = db.get_channel_owner(channel_id)
+    if not owner_id:
+        return
+    _last_notified[channel_id] = now
+    try:
+        await bot.send_message(owner_id, text)
+    except TelegramAPIError as e:
+        logging.warning("Egaga (%s) xabar yuborib bo'lmadi: %s", owner_id, e)
+
+
+# ---------- Majburiy obuna ----------
 
 SUBSCRIBE_KEYBOARD = InlineKeyboardMarkup(
     inline_keyboard=[
@@ -86,9 +141,7 @@ SUBSCRIBE_KEYBOARD = InlineKeyboardMarkup(
 
 
 async def _is_subscribed(user_id: int) -> "bool | None":
-    """True/False — aniq natija. None — tekshirib bo'lmadi (masalan bot
-    REQUIRED_CHANNEL'ga qo'shilmagan) — bunda foydalanishga ruxsat beramiz
-    (fail-open), aks holda texnik xatolik hammani bloklab qo'yishi mumkin."""
+    """True/False — aniq natija. None — tekshirib bo'lmadi (fail-open)."""
     try:
         member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
         return member.status in ("creator", "administrator", "member") or getattr(
@@ -100,8 +153,6 @@ async def _is_subscribed(user_id: int) -> "bool | None":
 
 
 async def _check_subscription(user_id: int) -> bool:
-    """Buyruqni davom ettirish mumkinmi (obuna bo'lgan yoki tekshirib
-    bo'lmagan holat) — faqat aniq "obuna emas" holatida False qaytaradi."""
     return await _is_subscribed(user_id) is not False
 
 
@@ -153,19 +204,25 @@ async def on_my_chat_member(update: ChatMemberUpdated):
             logging.warning("chat_id=%s: from_user yo'q, ro'yxatga olinmadi.", update.chat.id)
             return
 
-        owner_id = update.from_user.id
         title = update.chat.title or str(update.chat.id)
-        db.register_channel(update.chat.id, title, owner_id)
+        # Mavjud ega o'zgarmaydi (boshqa admin huquqni o'zgartirsa ham)
+        db.register_channel(update.chat.id, title, update.from_user.id)
+        owner_id = db.get_channel_owner(update.chat.id) or update.from_user.id
+        if owner_id != update.from_user.id:
+            logging.info(
+                "chat_id=%s: egasi %s, o'zgartirgan admin %s — ega o'zgarmadi.",
+                update.chat.id, owner_id, update.from_user.id,
+            )
 
         can_edit = getattr(update.new_chat_member, "can_edit_messages", False)
         if can_edit:
             text = (
-                f"✅ Kanal ro'yxatga olindi: <b>{title}</b>\n"
+                f"✅ Kanal ro'yxatga olindi: <b>{esc(title)}</b>\n"
                 "Endi /setcaption orqali shu kanal uchun izoh belgilashingiz mumkin."
             )
         else:
             text = (
-                f"⚠️ <b>{title}</b> qo'shildi, lekin ishlashi uchun kanal admin "
+                f"⚠️ <b>{esc(title)}</b> qo'shildi, lekin ishlashi uchun kanal admin "
                 "sozlamalarida <b>\"Xabarlarni tahrirlash\" (Edit Messages)</b> "
                 "huquqini ham yoqishingiz kerak."
             )
@@ -173,7 +230,7 @@ async def on_my_chat_member(update: ChatMemberUpdated):
         needs_subscription = await _is_subscribed(owner_id) is False
         if needs_subscription:
             text += (
-                f"\n\n⚠️ Botdan foydalanish uchun avval {REQUIRED_CHANNEL} "
+                f"\n\n⚠️ Botdan foydalanish uchun avval {esc(REQUIRED_CHANNEL)} "
                 "kanaliga obuna bo'lishingiz kerak."
             )
 
@@ -182,12 +239,23 @@ async def on_my_chat_member(update: ChatMemberUpdated):
                 owner_id, text,
                 reply_markup=SUBSCRIBE_KEYBOARD if needs_subscription else None,
             )
-        except TelegramBadRequest:
-            # Foydalanuvchi botga hali /start bosmagan bo'lishi mumkin —
-            # bunday holda unga shaxsiy xabar yubora olmaymiz.
+        except TelegramAPIError:
             logging.warning("owner_id=%s ga xabar yuborib bo'lmadi.", owner_id)
     elif status in ("left", "kicked", "member"):
-        db.remove_channel(update.chat.id)
+        # Sozlamalar (izoh, rejim) o'chirilmaydi — faqat nofaol qilinadi
+        owner_id = db.get_channel_owner(update.chat.id)
+        title = db.get_channel_title(update.chat.id) or str(update.chat.id)
+        db.deactivate_channel(update.chat.id)
+        if owner_id:
+            try:
+                await bot.send_message(
+                    owner_id,
+                    f"ℹ️ Bot <b>{esc(title)}</b> kanalida admin emas — izoh qo'shish "
+                    "to'xtadi. Sozlamalaringiz saqlanib qoldi: botni qayta admin "
+                    "qilsangiz, hammasi tiklanadi.",
+                )
+            except TelegramAPIError:
+                pass
 
 
 # ---------- Umumiy buyruqlar ----------
@@ -204,10 +272,18 @@ async def cmd_stats(message: Message):
     if message.from_user.id not in OPERATOR_IDS:
         return
 
+    modes = db.count_channels_by_mode()
+    modes_text = ", ".join(
+        f"{TRANSLIT_MODES.get(k, (k,))[0]}: {v}" for k, v in sorted(modes.items())
+    ) or "—"
     text = (
         "📊 <b>Bot statistikasi</b>\n\n"
         f"👥 Foydalanuvchilar: {db.count_owners()}\n"
-        f"📢 Ulangan kanallar: {db.count_channels()}"
+        f"📢 Ulangan kanallar: {db.count_channels()}\n"
+        f"📝 Izohi borlar: {db.count_channels_with_caption()}\n"
+        f"🔤 Rejimlar: {modes_text}\n"
+        f"✅ Qo'shilgan izohlar: jami {db.count_captions_applied()}, "
+        f"24 soatda {db.count_captions_applied(24)}"
     )
     await message.answer(text)
 
@@ -222,9 +298,14 @@ async def cmd_channels(message: Message):
         return
     lines = []
     for channel_id, title in channels:
-        has_caption = "✅ izoh bor" if db.get_caption(channel_id) else "— izoh yo'q"
-        mode_name = TRANSLIT_MODES[db.get_translit_mode(channel_id)][0]
-        lines.append(f"• {title} ({has_caption}, {mode_name})")
+        if db.get_paused(channel_id):
+            has_caption = "⏸ to'xtatilgan"
+        else:
+            has_caption = "✅ izoh bor" if db.get_caption(channel_id) else "— izoh yo'q"
+        mode_name = TRANSLIT_MODES.get(db.get_translit_mode(channel_id), ("?",))[0]
+        pos = "oldin" if db.get_caption_pos(channel_id) == "before" else "keyin"
+        count = db.count_captions_applied(channel_id=channel_id)
+        lines.append(f"• {esc(title)} ({has_caption}, {mode_name}, izoh {pos}, {count} ta post)")
     await message.answer("Sizga tegishli kanallar:\n" + "\n".join(lines))
 
 
@@ -251,15 +332,14 @@ async def cmd_set_caption(message: Message):
 async def cb_choose_setcaption(callback: CallbackQuery, state: FSMContext):
     if not await require_subscription_callback(callback):
         return
-    channel_id = int(callback.data.split(":", 1)[1])
-    if db.get_channel_owner(channel_id) != callback.from_user.id:
-        await callback.answer("Bu kanal sizga tegishli emas.", show_alert=True)
+    owned = await _owned_channel(callback)
+    if not owned:
         return
-    title = db.get_channel_title(channel_id) or str(channel_id)
+    channel_id, title = owned
     await state.set_state(SetCaption.waiting_for_text)
     await state.update_data(channel_id=channel_id)
     await callback.message.edit_text(
-        f"«{title}» uchun izoh matnini yuboring — qalin/kursiv shrift, havolalar "
+        f"«{esc(title)}» uchun izoh matnini yuboring — qalin/kursiv shrift, havolalar "
         f"va premium emojilar saqlanadi.\nBekor qilish uchun /cancel."
     )
     await callback.answer()
@@ -281,28 +361,32 @@ async def process_new_caption(message: Message, state: FSMContext):
         return
 
     plain_text = message.text or message.caption or ""
-    formatted_caption = message.html_text or plain_text
+    raw_html = message.html_text or plain_text
 
     if not plain_text.strip():
         await message.answer("Matn topilmadi. Qayta yuboring yoki /cancel bilan bekor qiling.")
         return
 
-    if len(plain_text) > MAX_CAPTION_LEN:
+    mode = db.get_translit_mode(channel_id)
+    preview = transliterate(raw_html, mode)
+
+    # Uzunlik o'girishdan KEYIN ham tekshiriladi (kirill→lotinda matn uzayadi)
+    longest = max(plain_len(raw_html), plain_len(preview))
+    if longest > MAX_CAPTION_LEN:
         await message.answer(
-            f"Matn juda uzun ({len(plain_text)} belgi). Maksimum {MAX_CAPTION_LEN} belgi bo'lishi kerak."
+            f"Matn juda uzun ({longest} belgi, o'girilgan holda). "
+            f"Maksimum {MAX_CAPTION_LEN} belgi bo'lishi kerak, post matni uchun joy ham qoldiring."
         )
         return
 
-    # Shu kanal uchun tanlangan yo'nalishda (lotin->kirill / kirill->lotin
-    # / o'chirilgan) o'girib, shu holatda saqlaymiz
-    mode = db.get_translit_mode(channel_id)
-    formatted_caption = transliterate(formatted_caption, mode)
-
-    db.set_caption(channel_id, formatted_caption)
+    # ASL matn saqlanadi; o'girish postga qo'shilayotganda joriy rejim bilan
+    db.set_caption(channel_id, raw_html)
     await state.clear()
     title = db.get_channel_title(channel_id) or str(channel_id)
-    await message.answer(f"✅ «{title}» uchun izoh saqlandi. Namuna qanday chiqishini pastda ko'rasiz 👇")
-    await message.answer(formatted_caption)
+    await message.answer(
+        f"✅ «{esc(title)}» uchun izoh saqlandi. Namuna qanday chiqishini pastda ko'rasiz 👇"
+    )
+    await message.answer(preview)
 
 
 # ---------- /caption ----------
@@ -324,18 +408,17 @@ async def cmd_get_caption(message: Message):
 async def cb_get_caption(callback: CallbackQuery):
     if not await require_subscription_callback(callback):
         return
-    channel_id = int(callback.data.split(":", 1)[1])
-    if db.get_channel_owner(channel_id) != callback.from_user.id:
-        await callback.answer("Bu kanal sizga tegishli emas.", show_alert=True)
+    owned = await _owned_channel(callback)
+    if not owned:
         return
-    title = db.get_channel_title(channel_id) or str(channel_id)
+    channel_id, title = owned
     caption = db.get_caption(channel_id)
     await callback.answer()
     if caption:
-        await callback.message.answer(f"«{title}» uchun joriy izoh:")
-        await callback.message.answer(caption)
+        await callback.message.answer(f"«{esc(title)}» uchun joriy izoh:")
+        await callback.message.answer(transliterate(caption, db.get_translit_mode(channel_id)))
     else:
-        await callback.message.answer(f"«{title}» uchun izoh hali belgilanmagan.")
+        await callback.message.answer(f"«{esc(title)}» uchun izoh hali belgilanmagan.")
 
 
 # ---------- /clearcaption ----------
@@ -357,14 +440,103 @@ async def cmd_clear_caption(message: Message):
 async def cb_clear_caption(callback: CallbackQuery):
     if not await require_subscription_callback(callback):
         return
-    channel_id = int(callback.data.split(":", 1)[1])
-    if db.get_channel_owner(channel_id) != callback.from_user.id:
-        await callback.answer("Bu kanal sizga tegishli emas.", show_alert=True)
+    owned = await _owned_channel(callback)
+    if not owned:
         return
-    title = db.get_channel_title(channel_id) or str(channel_id)
+    channel_id, title = owned
     db.clear_caption(channel_id)
     await callback.answer("O'chirildi")
-    await callback.message.edit_text(f"✅ «{title}» uchun avtomatik izoh o'chirildi.")
+    await callback.message.edit_text(f"✅ «{esc(title)}» uchun avtomatik izoh o'chirildi.")
+
+
+# ---------- /pause ----------
+
+@dp.message(Command("pause"), F.chat.type == "private")
+async def cmd_pause(message: Message):
+    if not await require_subscription_message(message):
+        return
+    if not db.list_channels_for_owner(message.from_user.id):
+        await _no_channels_message(message)
+        return
+    await message.answer(
+        "Qaysi kanal uchun izohni to'xtatamiz/yoqamiz?",
+        reply_markup=channels_keyboard("pause", message.from_user.id),
+    )
+
+
+@dp.callback_query(F.data.startswith("pause:"))
+async def cb_pause(callback: CallbackQuery):
+    if not await require_subscription_callback(callback):
+        return
+    owned = await _owned_channel(callback)
+    if not owned:
+        return
+    channel_id, title = owned
+    now_paused = not db.get_paused(channel_id)
+    db.set_paused(channel_id, now_paused)
+    await callback.answer("Saqlandi")
+    if now_paused:
+        text = f"⏸ «{esc(title)}» uchun izoh qo'shish vaqtincha to'xtatildi (izoh saqlanib turibdi). Qayta yoqish uchun yana /pause."
+    else:
+        text = f"▶️ «{esc(title)}» uchun izoh qo'shish qayta yoqildi."
+    await callback.message.edit_text(text)
+
+
+# ---------- /position ----------
+
+@dp.message(Command("position"), F.chat.type == "private")
+async def cmd_position(message: Message):
+    if not await require_subscription_message(message):
+        return
+    if not db.list_channels_for_owner(message.from_user.id):
+        await _no_channels_message(message)
+        return
+    await message.answer(
+        "Qaysi kanal uchun izoh joyini tanlaymiz?",
+        reply_markup=channels_keyboard("poschan", message.from_user.id),
+    )
+
+
+@dp.callback_query(F.data.startswith("poschan:"))
+async def cb_choose_position_channel(callback: CallbackQuery):
+    if not await require_subscription_callback(callback):
+        return
+    owned = await _owned_channel(callback)
+    if not owned:
+        return
+    channel_id, title = owned
+    current = db.get_caption_pos(channel_id)
+    options = [("after", "Post matnidan keyin"), ("before", "Post matnidan oldin")]
+    buttons = [
+        [InlineKeyboardButton(
+            text=("✅ " if key == current else "") + name,
+            callback_data=f"posset:{channel_id}:{key}",
+        )]
+        for key, name in options
+    ]
+    await callback.message.edit_text(
+        f"«{esc(title)}» uchun izoh joyini tanlang:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("posset:"))
+async def cb_set_position(callback: CallbackQuery):
+    if not await require_subscription_callback(callback):
+        return
+    owned = await _owned_channel(callback)
+    if not owned:
+        return
+    channel_id, title = owned
+    pos = callback.data.split(":")[2] if callback.data.count(":") >= 2 else ""
+    if pos not in ("before", "after"):
+        await callback.answer("Noto'g'ri tugma.", show_alert=True)
+        return
+    db.set_caption_pos(channel_id, pos)
+    label = "post matnidan oldin" if pos == "before" else "post matnidan keyin"
+    await callback.answer("Saqlandi")
+    await callback.message.edit_text(f"✅ «{esc(title)}» uchun izoh joyi: {label}")
 
 
 # ---------- /translit ----------
@@ -386,11 +558,10 @@ async def cmd_translit(message: Message):
 async def cb_choose_translit_channel(callback: CallbackQuery):
     if not await require_subscription_callback(callback):
         return
-    channel_id = int(callback.data.split(":", 1)[1])
-    if db.get_channel_owner(channel_id) != callback.from_user.id:
-        await callback.answer("Bu kanal sizga tegishli emas.", show_alert=True)
+    owned = await _owned_channel(callback)
+    if not owned:
         return
-    title = db.get_channel_title(channel_id) or str(channel_id)
+    channel_id, title = owned
     current = db.get_translit_mode(channel_id)
     buttons = [
         [InlineKeyboardButton(
@@ -400,7 +571,7 @@ async def cb_choose_translit_channel(callback: CallbackQuery):
         for key, (name, _fn) in TRANSLIT_MODES.items()
     ]
     await callback.message.edit_text(
-        f"«{title}» uchun o'girish rejimini tanlang:",
+        f"«{esc(title)}» uchun o'girish rejimini tanlang:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await callback.answer()
@@ -410,30 +581,51 @@ async def cb_choose_translit_channel(callback: CallbackQuery):
 async def cb_set_translit_mode(callback: CallbackQuery):
     if not await require_subscription_callback(callback):
         return
-    _, channel_id_str, mode = callback.data.split(":", 2)
-    channel_id = int(channel_id_str)
-    if db.get_channel_owner(channel_id) != callback.from_user.id:
-        await callback.answer("Bu kanal sizga tegishli emas.", show_alert=True)
+    owned = await _owned_channel(callback)
+    if not owned:
+        return
+    channel_id, title = owned
+    mode = callback.data.split(":", 2)[2] if callback.data.count(":") >= 2 else ""
+    if mode not in TRANSLIT_MODES:
+        await callback.answer("Bu tugma eskirgan, /translit ni qayta bosing.", show_alert=True)
         return
     db.set_translit_mode(channel_id, mode)
-    title = db.get_channel_title(channel_id) or str(channel_id)
-    mode_name = TRANSLIT_MODES[mode][0]
     await callback.answer("Saqlandi")
-    await callback.message.edit_text(f"✅ «{title}» uchun o'girish rejimi: {mode_name}")
+    await callback.message.edit_text(
+        f"✅ «{esc(title)}» uchun o'girish rejimi: {TRANSLIT_MODES[mode][0]}\n"
+        "Saqlangan izoh ham yangi rejim bo'yicha qo'shiladi."
+    )
 
 
 # ---------- Botga to'g'ridan-to'g'ri yozilgan matnni o'girish ----------
-# (kanal/izoh bilan bog'liq emas — shunchaki tez tekshirish uchun)
 
 _LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
 _CYRILLIC_LETTER_RE = re.compile(r"[Ѐ-ӿ]")
 
 
+def _split_text(text: str, size: int = 3800) -> list[str]:
+    """Uzun matnni qator chegarasidan bo'laklarga ajratadi."""
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        while len(line) > size:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:size])
+            line = line[size:]
+        if len(current) + len(line) + 1 > size and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
 @dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def echo_translit(message: Message):
-    """/setcaption kabi holatlarda ishlamaydi (o'sha handlerlar bu yerdan
-    oldin ro'yxatga olingan va ustuvor bo'ladi) — shunchaki botga yozilgan
-    har qanday matnni yo'nalishini avtomatik aniqlab o'giradi."""
+    """Botga yozilgan istalgan matnni yo'nalishini avtomatik aniqlab o'giradi."""
     if not await require_subscription_message(message):
         return
 
@@ -441,76 +633,153 @@ async def echo_translit(message: Message):
     latin_count = len(_LATIN_LETTER_RE.findall(raw_text))
     cyrillic_count = len(_CYRILLIC_LETTER_RE.findall(raw_text))
     if latin_count == 0 and cyrillic_count == 0:
-        return  # harflar yo'q (faqat raqam/emoji va h.k.) — tegmaymiz
+        return
 
     mode = "l2c" if latin_count >= cyrillic_count else "c2l"
-    html_text = message.html_text or raw_text
-    await message.answer(transliterate(html_text, mode))
+    result = transliterate(message.html_text or raw_text, mode)
+    for chunk in _split_text(result):
+        try:
+            await message.answer(chunk)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            await message.answer(chunk)
+        except TelegramBadRequest:
+            # Bo'lak teg o'rtasidan bo'linib qolgan bo'lishi mumkin — oddiy matn
+            await message.answer(chunk, parse_mode=None)
 
 
 # ---------- Kanal postlariga avtomatik izoh qo'shish ----------
 
-async def apply_caption(chat_id: int, message_id: int, base_html: str, caption_text: str) -> None:
-    # Postning o'z matnini ham shu kanal uchun tanlangan yo'nalishda o'giramiz
-    # (caption_text — admin sozlagan izoh — allaqachon o'girilgan holda saqlanadi)
+async def _edit_caption(chat_id: int, message_id: int, caption: str) -> "str | None":
+    """None — muvaffaqiyat, aks holda xato matni. Flood limitda kutib qayta urinadi.
+    Hech qachon 'zaxira variant' sifatida postning asl matnini o'chirmaydi."""
+    last_error = None
+    for _ in range(3):
+        try:
+            await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption)
+            return None
+        except TelegramRetryAfter as e:
+            logging.warning("Flood limit: %s soniya kutamiz (chat_id=%s)", e.retry_after, chat_id)
+            await asyncio.sleep(e.retry_after + 1)
+            last_error = str(e)
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                return None
+            return str(e)
+        except TelegramAPIError as e:
+            return str(e)
+    return last_error
+
+
+async def apply_caption(chat_id: int, message_id: int, base_html: str, caption_raw: str) -> None:
+    if db.get_paused(chat_id) or not db.is_active(chat_id):
+        return
+
     mode = db.get_translit_mode(chat_id)
+
+    # #izohsiz — izoh qo'shilmaydi, faqat belgining o'zi o'chiriladi
+    if SKIP_TAG_RE.search(base_html):
+        stripped = SKIP_TAG_RE.sub("", base_html).strip()
+        new_caption = transliterate(stripped, mode).strip()
+        err = await _edit_caption(chat_id, message_id, new_caption)
+        if err:
+            logging.error("#izohsiz belgisini o'chirib bo'lmadi: chat_id=%s, xato=%s", chat_id, err)
+        return
+
     old = transliterate(base_html, mode).strip()
-    new_caption = f"{old}\n\n{caption_text}" if old else caption_text
-    try:
-        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=new_caption)
+    cap = transliterate(caption_raw, mode).strip()
+    if not cap:
+        return
+    if cap in old:
+        return  # izoh allaqachon bor — ikki marta qo'shmaymiz
+
+    if db.get_caption_pos(chat_id) == "before":
+        new_caption = f"{cap}\n\n{old}" if old else cap
+    else:
+        new_caption = f"{old}\n\n{cap}" if old else cap
+
+    if plain_len(new_caption) > MAX_CAPTION_LEN:
+        logging.error(
+            "Caption uzun (%s belgi): chat_id=%s, message_id=%s — post o'zgarishsiz qoldi.",
+            plain_len(new_caption), chat_id, message_id,
+        )
+        await notify_owner(
+            chat_id,
+            f"⚠️ «{esc(db.get_channel_title(chat_id) or chat_id)}» kanalidagi postga izoh "
+            f"qo'shilmadi: post matni + izoh {plain_len(new_caption)} belgi bo'ldi "
+            f"(limit {MAX_CAPTION_LEN}). Izohni qisqartiring: /setcaption.",
+        )
+        return
+
+    err = await _edit_caption(chat_id, message_id, new_caption)
+    if err is None:
         logging.info("Caption yangilandi: chat_id=%s, message_id=%s", chat_id, message_id)
         db.log_caption_applied(chat_id)
-    except TelegramAPIError as e:
-        logging.error(
-            "Caption tahrirlashda xatolik (birinchi urinish): chat_id=%s, message_id=%s, xato=%s",
-            chat_id, message_id, e,
-        )
-        try:
-            await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption_text)
-            logging.info("Caption (zaxira variant) yangilandi: chat_id=%s, message_id=%s", chat_id, message_id)
-            db.log_caption_applied(chat_id)
-        except TelegramAPIError as e2:
-            logging.error(
-                "Caption tahrirlashda xatolik (ikkinchi urinish): chat_id=%s, message_id=%s, xato=%s",
-                chat_id, message_id, e2,
-            )
+        return
+
+    logging.error(
+        "Caption tahrirlashda xatolik: chat_id=%s, message_id=%s, xato=%s",
+        chat_id, message_id, err,
+    )
+    await notify_owner(
+        chat_id,
+        f"⚠️ «{esc(db.get_channel_title(chat_id) or chat_id)}» kanalidagi postga izoh "
+        f"qo'shib bo'lmadi.\nSabab: <code>{esc(err)}</code>\n"
+        "Botda <b>\"Xabarlarni tahrirlash\" (Edit Messages)</b> huquqi yoqilganini tekshiring.",
+    )
 
 
-@dp.channel_post(~F.media_group_id, F.video | F.photo)
+@dp.channel_post(~F.media_group_id, MEDIA_FILTER)
 async def handle_channel_post(message: Message):
-    """Yakka (albom bo'lmagan) video/rasm postlari."""
+    """Yakka (albom bo'lmagan) media postlari."""
     caption_text = db.get_caption(message.chat.id)
     if not caption_text:
         return
     await apply_caption(message.chat.id, message.message_id, message.html_text or "", caption_text)
 
 
-@dp.channel_post(F.media_group_id, F.video | F.photo)
+@dp.channel_post(F.media_group_id, MEDIA_FILTER)
 async def handle_album_item(message: Message):
-    """Albom (bir vaqtda yuborilgan bir nechta video/rasm) postlari."""
+    """Albom (bir vaqtda yuborilgan bir nechta media) postlari."""
     group_id = message.media_group_id
-    album_messages.setdefault(group_id, []).append(message)
 
+    # Eski yozuvlarni tozalaymiz
+    now = time.monotonic()
+    for gid in [g for g, t in album_done.items() if now - t > 120]:
+        album_done.pop(gid, None)
+
+    # Albom allaqachon qayta ishlangan (yoki ishlanmoqda) — kech kelgan
+    # element ishlayotgan tahrirni bekor qilmasin
+    if group_id in album_done:
+        return
+
+    album_messages.setdefault(group_id, []).append(message)
     if group_id in album_tasks:
         album_tasks[group_id].cancel()
     album_tasks[group_id] = asyncio.create_task(process_album(group_id))
 
 
 async def process_album(group_id: str) -> None:
-    await asyncio.sleep(ALBUM_DEBOUNCE)
+    try:
+        await asyncio.sleep(ALBUM_DEBOUNCE)
+    except asyncio.CancelledError:
+        return
+    album_done[group_id] = time.monotonic()
     messages = album_messages.pop(group_id, [])
     album_tasks.pop(group_id, None)
     if not messages:
         return
 
-    first = min(messages, key=lambda m: m.message_id)
-    caption_text = db.get_caption(first.chat.id)
+    chat_id = messages[0].chat.id
+    caption_text = db.get_caption(chat_id)
     if not caption_text:
         return
 
-    # Telegram butun albom uchun faqat BITTA elementning (birinchisining)
-    # izohini ko'rsatadi — shu sabab faqat o'shanga yozamiz
-    await apply_caption(first.chat.id, first.message_id, first.html_text or "", caption_text)
+    # Telegram butun albom uchun faqat BITTA izohni ko'rsatadi — asl izohi
+    # bor elementni tanlaymiz, bo'lmasa birinchisini
+    messages.sort(key=lambda m: m.message_id)
+    target = next((m for m in messages if (m.html_text or "").strip()), messages[0])
+    await apply_caption(chat_id, target.message_id, target.html_text or "", caption_text)
 
 
 async def main():
@@ -525,12 +794,12 @@ async def main():
             logging.warning("Eski CHANNEL_ID uchun ma'lumot olinmadi: %s", e)
         db.migrate_legacy_caption(LEGACY_CHANNEL_ID)
 
-    # Omma uchun ochilishidan oldin ro'yxatga olingan, egasi biriktirilmagan
-    # kanallarni botning operatoriga (siz) bog'laymiz — bir martalik migratsiya.
     if OPERATOR_IDS:
         db.assign_default_owner(OPERATOR_IDS[0])
 
-    await bot.delete_webhook(drop_pending_updates=True)
+    # drop_pending_updates=False: bot o'chiq turganda tashlangan postlar
+    # qayta ishga tushganda izohsiz qolib ketmasin
+    await bot.delete_webhook(drop_pending_updates=False)
     await dp.start_polling(bot)
 
 
