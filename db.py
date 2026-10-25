@@ -69,6 +69,15 @@ def init_db() -> None:
             )
             """
         )
+        # Botga to'g'ridan-to'g'ri yozilgan matn uchun foydalanuvchi tanlagan rejim
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_modes (
+                user_id INTEGER PRIMARY KEY,
+                mode TEXT
+            )
+            """
+        )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS caption_log (
@@ -225,6 +234,24 @@ def set_caption_pos(channel_id: int, pos: str) -> None:
     with _conn() as conn:
         conn.execute(
             "UPDATE channels SET caption_pos = ? WHERE channel_id = ?", (pos, channel_id)
+        )
+
+
+def get_user_mode(user_id: int) -> str:
+    """Shaxsiy chatdagi o'girish rejimi: 'auto' (standart), 'l2c', 'c2l', 'new'."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT mode FROM user_modes WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return row[0] if row and row[0] else "auto"
+
+
+def set_user_mode(user_id: int, mode: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO user_modes (user_id, mode) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET mode = excluded.mode",
+            (user_id, mode),
         )
 
 

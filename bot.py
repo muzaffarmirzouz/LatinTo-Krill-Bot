@@ -16,7 +16,9 @@ from aiogram.types import (
     ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 
 import db
@@ -42,6 +44,27 @@ album_tasks: dict[str, asyncio.Task] = {}
 album_done: dict[str, float] = {}
 _last_notified: dict[int, float] = {}
 
+# Shaxsiy chatdagi pastki tugmalar (yozuv turini tanlash)
+BTN_L2C = "🔤 Lotin → Kirill"
+BTN_C2L = "🔤 Kirill → Lotin"
+BTN_NEW = "✨ Yangi alifbo"
+BTN_AUTO = "🔄 Avto"
+USER_MODE_BUTTONS = {BTN_L2C: "l2c", BTN_C2L: "c2l", BTN_NEW: "new", BTN_AUTO: "auto"}
+MENU_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_L2C), KeyboardButton(text=BTN_C2L)],
+        [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_AUTO)],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Matn yuboring…",
+)
+USER_MODE_INFO = {
+    "l2c": "Lotin → Kirill",
+    "c2l": "Kirill → Lotin",
+    "new": "Yangi alifbo (sh→ş, ch→ç, o'→ö, g'→ğ)",
+    "auto": "Avto (lotin yozsangiz kirillga, kirill yozsangiz lotinga)",
+}
+
 WELCOME_TEXT = (
     "Salom! 👋\n\n"
     "Men kanalga tashlangan video/rasm/fayllarga <b>siz belgilagan izohni avtomatik "
@@ -65,8 +88,17 @@ WELCOME_TEXT = (
     "/translit — kanal uchun lotin↔kirill o'girish yo'nalishini tanlash\n"
     "/channels — sizga tegishli kanallar ro'yxati\n\n"
     "💡 Post matniga <code>#izohsiz</code> yozsangiz, o'sha postga izoh qo'shilmaydi "
-    "(belgi o'zi o'chiriladi).\n"
-    "💡 Botga to'g'ridan-to'g'ri matn yozsangiz, uni lotin↔kirill o'girib beraman."
+    "(belgi o'zi o'chiriladi).\n\n"
+    "<b>Matn o'girish (kanalsiz ham ishlaydi):</b>\n"
+    "Pastdagi tugmalardan birini tanlang, so'ng botga matn yuboring:\n"
+    "🔤 Lotin → Kirill\n"
+    "🔤 Kirill → Lotin\n"
+    "✨ Yangi alifbo — lotin yoki kirilldagi matnni yangi harflarga o'giradi: "
+    "<b>sh→ş, ch→ç, o'→ö, g'→ğ</b>\n"
+    "🔄 Avto — yozuvni o'zi aniqlaydi\n"
+    "Buyruqlar: /lotin_kirill, /kirill_lotin, /yangi_alifbo, /avto\n\n"
+    "Kanalda yangi alifbo uchun /translit orqali <b>Yangi alifbo</b> rejimini tanlang — "
+    "postlardagi eski harflar avtomatik yangisiga o'zgaradi."
 )
 
 
@@ -183,6 +215,9 @@ async def cb_check_sub(callback: CallbackQuery):
         return
     await callback.answer("✅ Rahmat!")
     await callback.message.edit_text(WELCOME_TEXT)
+    await callback.message.answer(
+        "⌨️ Pastdagi tugmalardan yozuv turini tanlang 👇", reply_markup=MENU_KB
+    )
 
 
 # ---------- Kanal bot admin qilib qo'shilganda/olib tashlanganda ----------
@@ -264,7 +299,44 @@ async def on_my_chat_member(update: ChatMemberUpdated):
 async def cmd_start(message: Message):
     if not await require_subscription_message(message):
         return
-    await message.answer(WELCOME_TEXT)
+    await message.answer(WELCOME_TEXT, reply_markup=MENU_KB)
+
+
+async def _set_user_mode(message: Message, mode: str) -> None:
+    if not await require_subscription_message(message):
+        return
+    db.set_user_mode(message.from_user.id, mode)
+    await message.answer(
+        f"✅ Rejim: <b>{USER_MODE_INFO[mode]}</b>\nEndi matn yuboring — o'girib beraman.",
+        reply_markup=MENU_KB,
+    )
+
+
+# Tugmalar va buyruqlar /setcaption holatidan OLDIN ro'yxatga olinadi,
+# shunda ular izoh matni sifatida qabul qilinib qolmaydi.
+@dp.message(F.chat.type == "private", F.text.in_(USER_MODE_BUTTONS))
+async def btn_user_mode(message: Message):
+    await _set_user_mode(message, USER_MODE_BUTTONS[message.text])
+
+
+@dp.message(Command("lotin_kirill"), F.chat.type == "private")
+async def cmd_mode_l2c(message: Message):
+    await _set_user_mode(message, "l2c")
+
+
+@dp.message(Command("kirill_lotin"), F.chat.type == "private")
+async def cmd_mode_c2l(message: Message):
+    await _set_user_mode(message, "c2l")
+
+
+@dp.message(Command("yangi_alifbo"), F.chat.type == "private")
+async def cmd_mode_new(message: Message):
+    await _set_user_mode(message, "new")
+
+
+@dp.message(Command("avto"), F.chat.type == "private")
+async def cmd_mode_auto(message: Message):
+    await _set_user_mode(message, "auto")
 
 
 @dp.message(Command("stats"), F.chat.type == "private")
@@ -635,8 +707,19 @@ async def echo_translit(message: Message):
     if latin_count == 0 and cyrillic_count == 0:
         return
 
-    mode = "l2c" if latin_count >= cyrillic_count else "c2l"
-    result = transliterate(message.html_text or raw_text, mode)
+    mode = db.get_user_mode(message.from_user.id)
+    if mode == "auto":
+        mode = "l2c" if latin_count >= cyrillic_count else "c2l"
+
+    source = message.html_text or raw_text
+    result = transliterate(source, mode)
+    if result == source:
+        await message.answer(
+            "Bu matnda o'zgartiriladigan harf topilmadi (tanlangan rejim: "
+            f"<b>{USER_MODE_INFO.get(mode, mode)}</b>). Boshqa rejim uchun pastdagi tugmalardan foydalaning.",
+            reply_markup=MENU_KB,
+        )
+        return
     for chunk in _split_text(result):
         try:
             await message.answer(chunk)
@@ -669,6 +752,67 @@ async def _edit_caption(chat_id: int, message_id: int, caption: str) -> "str | N
         except TelegramAPIError as e:
             return str(e)
     return last_error
+
+
+async def _edit_text(chat_id: int, message_id: int, text: str, link_preview_options=None) -> "str | None":
+    """Faqat matnli kanal postini tahrirlaydi (None — muvaffaqiyat)."""
+    last_error = None
+    for _ in range(3):
+        try:
+            await bot.edit_message_text(
+                text=text, chat_id=chat_id, message_id=message_id,
+                link_preview_options=link_preview_options,
+            )
+            return None
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            last_error = str(e)
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                return None
+            return str(e)
+        except TelegramAPIError as e:
+            return str(e)
+    return last_error
+
+
+async def apply_text_post(message: Message) -> None:
+    """Faqat 'Yangi alifbo' rejimida: matnli postdagi eski harflar (lotin/kirill)
+    yangi alifboga o'zgartiriladi. Boshqa rejimlarda matnli postlarga tegilmaydi."""
+    chat_id = message.chat.id
+    if db.get_paused(chat_id) or not db.is_active(chat_id):
+        return
+    if db.get_translit_mode(chat_id) != "new":
+        return
+
+    base = message.html_text or ""
+    source = SKIP_TAG_RE.sub("", base).strip() if SKIP_TAG_RE.search(base) else base
+    new_text = transliterate(source, "new")
+    if new_text == base or not new_text.strip():
+        return
+    if plain_len(new_text) > MAX_MESSAGE_LEN:
+        return
+
+    err = await _edit_text(
+        chat_id, message.message_id, new_text,
+        link_preview_options=getattr(message, "link_preview_options", None),
+    )
+    if err is None:
+        db.log_caption_applied(chat_id)
+        return
+    logging.error("Matnli postni o'zgartirib bo'lmadi: chat_id=%s, xato=%s", chat_id, err)
+    await notify_owner(
+        chat_id,
+        f"⚠️ «{esc(db.get_channel_title(chat_id) or chat_id)}» kanalidagi postni yangi alifboga "
+        f"o'zgartirib bo'lmadi.\nSabab: <code>{esc(err)}</code>\n"
+        "Botda <b>\"Xabarlarni tahrirlash\" (Edit Messages)</b> huquqi yoqilganini tekshiring.",
+    )
+
+
+@dp.channel_post(F.text)
+async def handle_channel_text(message: Message):
+    """Matnli kanal postlari (faqat Yangi alifbo rejimida o'zgartiriladi)."""
+    await apply_text_post(message)
 
 
 async def apply_caption(chat_id: int, message_id: int, base_html: str, caption_raw: str) -> None:

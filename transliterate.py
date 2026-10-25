@@ -228,9 +228,54 @@ def cyrillic_to_latin_html(html: str) -> str:
     return _apply_html_transform(html, _CYR_WORD_PATTERN, _cyr_to_lat_word)
 
 
+# ============================== YANGI ALIFBO ==============================
+# Yangi o'zbek lotin alifbosi: sh -> ş, ch -> ç, o' -> ö, g' -> ğ
+
+_NEW_ALPHABET_OG = {"o": "ö", "g": "ğ"}
+
+
+def _latin_word_to_new(word: str) -> str:
+    """Eski lotin yozuvdagi so'zni yangi alifboga o'giradi (Sh -> Ş, O' -> Ö ...)."""
+    out = []
+    i = 0
+    n = len(word)
+    while i < n:
+        c = word[i]
+        lc = c.lower()
+        if lc in _NEW_ALPHABET_OG and i + 1 < n and word[i + 1] in _APOSTROPHES_SET:
+            out.append(_cased(c, _NEW_ALPHABET_OG[lc]))
+            i += 2
+            continue
+        if i + 1 < n:
+            pair = lc + word[i + 1].lower()
+            if pair == "sh":
+                out.append(_cased(c, "ş"))
+                i += 2
+                continue
+            if pair == "ch":
+                out.append(_cased(c, "ç"))
+                i += 2
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _cyr_word_to_new(word: str) -> str:
+    return _latin_word_to_new(_cyr_to_lat_word(word))
+
+
+def new_alphabet_html(html: str) -> str:
+    """Lotin (eski yozuv) VA kirill matnni yangi alifboga o'giradi.
+    HTML teglari, URL, @mention va hokazolarga tegilmaydi."""
+    step1 = _apply_html_transform(html, _CYR_WORD_PATTERN, _cyr_word_to_new)
+    return _apply_html_transform(step1, _LAT_WORD_PATTERN, _latin_word_to_new)
+
+
 TRANSLIT_MODES = {
     "l2c": ("Lotin → Kirill", latin_to_cyrillic_html),
     "c2l": ("Kirill → Lotin", cyrillic_to_latin_html),
+    "new": ("Yangi alifbo (ş ç ö ğ)", new_alphabet_html),
     "off": ("O'chirilgan", lambda html: html),
 }
 # Yangi kanallar uchun standart: post matniga tegmaslik
