@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import time
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.filters import Command
@@ -33,6 +33,31 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
+
+_seen_cache: dict[int, float] = {}
+SEEN_REFRESH = 600  # bir foydalanuvchini bazaga 10 daqiqada bir martadan ko'p yozmaymiz
+
+
+class UserTrackerMiddleware(BaseMiddleware):
+    """Shaxsiy chatda botga yozgan/tugma bosgan har bir odamni hisobga oladi."""
+
+    async def __call__(self, handler, event, data):
+        try:
+            user = getattr(event, "from_user", None)
+            msg = event if isinstance(event, Message) else getattr(event, "message", None)
+            chat = getattr(msg, "chat", None)
+            if user and not user.is_bot and chat is not None and chat.type == "private":
+                now = time.monotonic()
+                if now - _seen_cache.get(user.id, -SEEN_REFRESH) >= SEEN_REFRESH:
+                    _seen_cache[user.id] = now
+                    db.touch_user(user.id, user.username)
+        except Exception:  # noqa: BLE001 — statistika hech qachon botni to'xtatmasin
+            logging.exception("Foydalanuvchini hisobga olishda xatolik")
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(UserTrackerMiddleware())
+dp.callback_query.outer_middleware(UserTrackerMiddleware())
 
 MAX_CAPTION_LEN = 1024  # Telegramning media caption limiti (teglarsiz belgilar)
 MAX_MESSAGE_LEN = 4096  # oddiy xabar limiti
@@ -354,14 +379,26 @@ async def cmd_stats(message: Message):
     modes_text = ", ".join(
         f"{TRANSLIT_MODES.get(k, (k,))[0]}: {v}" for k, v in sorted(modes.items())
     ) or "—"
+    paused = db.count_paused_channels()
     text = (
         "📊 <b>Bot statistikasi</b>\n\n"
-        f"👥 Foydalanuvchilar: {db.count_owners()}\n"
-        f"📢 Ulangan kanallar: {db.count_channels()}\n"
+        "<b>Foydalanuvchilar</b>\n"
+        f"👥 Botdan foydalanganlar: {db.count_users()}\n"
+        f"🆕 Yangi (24 soat): {db.count_users(new_hours=24)}\n"
+        f"🔥 Faol (24 soat / 7 kun): {db.count_users(active_hours=24)} / {db.count_users(active_hours=24 * 7)}\n"
+        f"👤 Kanal egalari: {db.count_owners()}\n\n"
+        "<b>Kanallar</b>\n"
+        f"📢 Ulangan kanallar: {db.count_channels()}"
+        + (f" (⏸ to'xtatilgan: {paused})" if paused else "")
+        + "\n"
         f"📝 Izohi borlar: {db.count_channels_with_caption()}\n"
-        f"🔤 Rejimlar: {modes_text}\n"
-        f"✅ Qo'shilgan izohlar: jami {db.count_captions_applied()}, "
-        f"24 soatda {db.count_captions_applied(24)}"
+        f"🔤 Rejimlar: {modes_text}\n\n"
+        "<b>Faoliyat</b>\n"
+        f"✅ Postlarga izoh/o'girish: jami {db.count_captions_applied()}, "
+        f"24 soatda {db.count_captions_applied(24)}, 7 kunda {db.count_captions_applied(24 * 7)}\n"
+        f"💬 Shaxsiy chatda matn o'girildi: {db.get_counter('texts')}\n"
+        f"📷 Fayl/rasm/PDF o'girildi: {db.get_counter('files')}\n\n"
+        "<i>Foydalanuvchilar soni yangi versiya ishga tushgandan boshlab hisoblanadi.</i>"
     )
     await message.answer(text)
 
@@ -726,6 +763,7 @@ async def echo_translit(message: Message):
             reply_markup=MENU_KB,
         )
         return
+    db.bump_counter("texts")
     for chunk in _split_text(result):
         try:
             await message.answer(chunk)
@@ -888,6 +926,7 @@ async def on_file_to_text(message: Message):
         cyr = len(_CYRILLIC_LETTER_RE.findall(text))
         mode = "l2c" if latin >= cyr else "c2l"
 
+    db.bump_counter("files")
     # OCR matni oddiy matn: HTML belgilarini himoyalab, o'giramiz
     converted_html = transliterate(esc(text), mode)
     converted_plain = html_lib.unescape(converted_html)

@@ -100,11 +100,43 @@ def init_db() -> None:
         if not _column_exists(cur, "channels", "caption_pos"):
             cur.execute("ALTER TABLE channels ADD COLUMN caption_pos TEXT DEFAULT 'after'")
 
+        # Botdan foydalangan hamma shaxsiy chat foydalanuvchilari (statistika uchun)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_seen TEXT,
+                last_seen TEXT
+            )
+            """
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER DEFAULT 0)"
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_caption_log_ts ON caption_log(ts)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_channels_owner ON channels(owner_id)")
-        # Jurnal cheksiz o'smasligi uchun eskilarini tozalaymiz
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen)")
+
+        # Mavjud kanal egalarini ham foydalanuvchi sifatida hisobga olamiz
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cur.execute(
+            "INSERT OR IGNORE INTO users (user_id, first_seen, last_seen) "
+            "SELECT DISTINCT owner_id, ?, ? FROM channels WHERE owner_id IS NOT NULL",
+            (now_iso, now_iso),
+        )
+
+        # Eski jurnal qatorlari o'chirilmaydi, balki umumiy hisobga qo'shib
+        # qo'yiladi — "jami" son hech qachon kamaymaydi
         cutoff = (datetime.now(timezone.utc) - timedelta(days=LOG_KEEP_DAYS)).isoformat()
-        cur.execute("DELETE FROM caption_log WHERE ts < ?", (cutoff,))
+        old_n = cur.execute("SELECT COUNT(*) FROM caption_log WHERE ts < ?", (cutoff,)).fetchone()[0]
+        if old_n:
+            cur.execute(
+                "INSERT INTO counters (name, value) VALUES ('applied_archived', ?) "
+                "ON CONFLICT(name) DO UPDATE SET value = value + excluded.value",
+                (old_n,),
+            )
+            cur.execute("DELETE FROM caption_log WHERE ts < ?", (cutoff,))
 
 
 def migrate_legacy_caption(channel_id: Optional[int]) -> None:
@@ -142,7 +174,8 @@ def register_channel(channel_id: int, title: str, owner_id: int) -> bool:
         cur.execute("SELECT 1 FROM channels WHERE channel_id = ?", (channel_id,))
         existed = cur.fetchone() is not None
         cur.execute(
-            "INSERT INTO channels (channel_id, title, owner_id, active) VALUES (?, ?, ?, 1) "
+            "INSERT INTO channels (channel_id, title, owner_id, active, translit_mode) "
+            "VALUES (?, ?, ?, 1, 'off') "
             "ON CONFLICT(channel_id) DO UPDATE SET "
             "title = excluded.title, "
             "owner_id = COALESCE(channels.owner_id, excluded.owner_id), "
@@ -271,6 +304,53 @@ def count_channels() -> int:
     return row[0] if row else 0
 
 
+def touch_user(user_id: int, username: Optional[str] = None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO users (user_id, username, first_seen, last_seen) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET last_seen = excluded.last_seen, "
+            "username = COALESCE(excluded.username, users.username)",
+            (user_id, username, now, now),
+        )
+
+
+def count_users(active_hours: Optional[int] = None, new_hours: Optional[int] = None) -> int:
+    """Jami / so'nggi N soatda faol / so'nggi N soatda qo'shilgan foydalanuvchilar."""
+    query = "SELECT COUNT(*) FROM users WHERE 1=1"
+    params: list = []
+    if active_hours is not None:
+        query += " AND last_seen >= ?"
+        params.append((datetime.now(timezone.utc) - timedelta(hours=active_hours)).isoformat())
+    if new_hours is not None:
+        query += " AND first_seen >= ?"
+        params.append((datetime.now(timezone.utc) - timedelta(hours=new_hours)).isoformat())
+    with _conn() as conn:
+        return conn.execute(query, params).fetchone()[0]
+
+
+def bump_counter(name: str, n: int = 1) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO counters (name, value) VALUES (?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET value = value + excluded.value",
+            (name, n),
+        )
+
+
+def get_counter(name: str) -> int:
+    with _conn() as conn:
+        row = conn.execute("SELECT value FROM counters WHERE name = ?", (name,)).fetchone()
+    return row[0] if row else 0
+
+
+def count_paused_channels() -> int:
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM channels WHERE COALESCE(active, 1) = 1 AND COALESCE(paused, 0) = 1"
+        ).fetchone()[0]
+
+
 def count_owners() -> int:
     with _conn() as conn:
         row = conn.execute(
@@ -322,7 +402,14 @@ def count_captions_applied(
         params.append(channel_id)
     with _conn() as conn:
         row = conn.execute(query, params).fetchone()
-    return row[0] if row else 0
+        total = row[0] if row else 0
+        # Faqat "jami" so'ralganda (vaqt va kanal filtrisiz) arxivlanganlar qo'shiladi
+        if since_hours is None and channel_id is None:
+            arch = conn.execute(
+                "SELECT value FROM counters WHERE name = 'applied_archived'"
+            ).fetchone()
+            total += arch[0] if arch else 0
+    return total
 
 
 def get_caption(channel_id: int) -> Optional[str]:
