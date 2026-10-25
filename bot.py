@@ -1,7 +1,10 @@
 import asyncio
 import html as html_lib
 import logging
+import os
 import re
+import shutil
+import tempfile
 import time
 
 from aiogram import Bot, Dispatcher, F
@@ -12,6 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     ChatMemberUpdated,
     InlineKeyboardButton,
@@ -96,7 +100,9 @@ WELCOME_TEXT = (
     "✨ Yangi alifbo — lotin yoki kirilldagi matnni yangi harflarga o'giradi: "
     "<b>sh→ş, ch→ç, o'→ö, g'→ğ</b>\n"
     "🔄 Avto — yozuvni o'zi aniqlaydi\n"
-    "Buyruqlar: /lotin_kirill, /kirill_lotin, /yangi_alifbo, /avto\n\n"
+    "Buyruqlar: /lotin_kirill, /kirill_lotin, /yangi_alifbo, /avto\n"
+    "📷 Matnli <b>rasm</b>, <b>PDF</b> yoki <b>.txt</b> fayl yuborsangiz ham, matnni o'qib, "
+    "tanlangan rejimda o'girib beraman.\n\n"
     "Kanalda yangi alifbo uchun /translit orqali <b>Yangi alifbo</b> rejimini tanlang — "
     "postlardagi eski harflar avtomatik yangisiga o'zgaradi."
 )
@@ -729,6 +735,173 @@ async def echo_translit(message: Message):
         except TelegramBadRequest:
             # Bo'lak teg o'rtasidan bo'linib qolgan bo'lishi mumkin — oddiy matn
             await message.answer(chunk, parse_mode=None)
+
+
+# ---------- Rasm / PDF / .txt fayldan matn o'qib o'girish ----------
+
+MAX_FILE_BYTES = 15 * 1024 * 1024  # Telegram bot yuklab olish limiti 20 MB, zaxira bilan
+OCR_MAX_PAGES = 20
+OCR_TIMEOUT = 120  # soniya (bitta rasm/sahifa uchun)
+SHORT_RESULT_LEN = 3800  # shundan uzun natija .txt fayl bo'lib yuboriladi
+_ocr_semaphore = asyncio.Semaphore(2)  # bir vaqtda ko'pi bilan 2 ta OCR
+
+
+def _ocr_lang(mode: str) -> str:
+    """Rejimga qarab Tesseract tillari (kerakli til paketlari Dockerfile'da)."""
+    if mode == "l2c":
+        return "uzb"
+    if mode == "c2l":
+        return "uzb_cyrl+rus"
+    return "uzb+uzb_cyrl+rus"  # new / auto
+
+
+async def _run_tesseract(image_path: str, lang: str) -> str:
+    if not shutil.which("tesseract"):
+        raise RuntimeError("Serverda Tesseract o'rnatilmagan (Dockerfile bilan deploy qiling).")
+    proc = await asyncio.create_subprocess_exec(
+        "tesseract", image_path, "stdout", "-l", lang, "--psm", "3",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), OCR_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError("Matnni o'qish juda uzoq davom etdi.")
+    if proc.returncode != 0:
+        raise RuntimeError("OCR xatosi: " + err.decode("utf-8", "ignore")[:200])
+    return out.decode("utf-8", "ignore")
+
+
+def _extract_pdf(path: str, tmpdir: str):
+    """PDF'dan sahifa matnlarini oladi. Matni yo'q (skaner) sahifalar PNG
+    sifatida saqlanadi — keyin OCR qilinadi. (pages, jami_sahifa) qaytaradi."""
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        import fitz  # eski nom
+    doc = fitz.open(path)
+    try:
+        total = doc.page_count
+        pages = []
+        for i in range(min(total, OCR_MAX_PAGES)):
+            page = doc[i]
+            text = page.get_text().strip()
+            if len(text) >= 30:
+                pages.append((text, None))
+            else:
+                png = os.path.join(tmpdir, f"page{i}.png")
+                page.get_pixmap(dpi=200).save(png)
+                pages.append(("", png))
+        return pages, total
+    finally:
+        doc.close()
+
+
+async def _extract_text(kind: str, path: str, tmpdir: str, mode: str):
+    """(matn, izoh) qaytaradi."""
+    lang = _ocr_lang(mode)
+    if kind == "txt":
+        with open(path, "rb") as f:
+            raw = f.read()
+        for enc in ("utf-8-sig", "cp1251"):
+            try:
+                return raw.decode(enc), ""
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", "ignore"), ""
+    if kind == "image":
+        return (await _run_tesseract(path, lang)).strip(), ""
+
+    pages, total = await asyncio.to_thread(_extract_pdf, path, tmpdir)
+    parts = []
+    for text, png in pages:
+        if png:
+            text = (await _run_tesseract(png, lang)).strip()
+        if text:
+            parts.append(text)
+    note = f"Faqat dastlabki {OCR_MAX_PAGES} sahifa o'qildi (jami {total})." if total > OCR_MAX_PAGES else ""
+    return "\n\n".join(parts), note
+
+
+def _file_kind(message: Message):
+    """(kind, file_id, size, ext) yoki None."""
+    if message.photo:
+        p = message.photo[-1]
+        return "image", p.file_id, p.file_size or 0, ".jpg"
+    doc = message.document
+    if not doc:
+        return None
+    mime = (doc.mime_type or "").lower()
+    name = (doc.file_name or "").lower()
+    if mime == "application/pdf" or name.endswith(".pdf"):
+        return "pdf", doc.file_id, doc.file_size or 0, ".pdf"
+    if mime.startswith("image/") and mime != "image/gif":
+        return "image", doc.file_id, doc.file_size or 0, os.path.splitext(name)[1] or ".jpg"
+    if mime.startswith("text/") or name.endswith(".txt"):
+        return "txt", doc.file_id, doc.file_size or 0, ".txt"
+    return None
+
+
+@dp.message(F.chat.type == "private", F.photo | F.document)
+async def on_file_to_text(message: Message):
+    if not await require_subscription_message(message):
+        return
+    info = _file_kind(message)
+    if not info:
+        await message.answer("Faqat rasm, PDF yoki .txt fayl yuboring.", reply_markup=MENU_KB)
+        return
+    kind, file_id, size, ext = info
+    if size and size > MAX_FILE_BYTES:
+        await message.answer("Fayl juda katta (15 MB dan oshmasligi kerak).")
+        return
+
+    mode = db.get_user_mode(message.from_user.id)
+    status = await message.answer("⏳ Fayl o'qilmoqda… (katta PDF bir necha daqiqa olishi mumkin)")
+    try:
+        async with _ocr_semaphore:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "input" + ext)
+                await bot.download(file_id, destination=path)
+                text, note = await _extract_text(kind, path, tmp, mode)
+    except Exception as e:  # noqa: BLE001 — foydalanuvchiga tushunarli xabar
+        logging.exception("Fayldan matn o'qishda xatolik")
+        try:
+            await status.edit_text(f"❌ Faylni o'qib bo'lmadi: {esc(e)}")
+        except TelegramAPIError:
+            pass
+        return
+
+    try:
+        await status.delete()
+    except TelegramAPIError:
+        pass
+
+    text = text.strip()
+    if not text:
+        await message.answer(
+            "Faylda matn topilmadi. Rasm aniqroq (yorug', tekis, katta) bo'lsa, qayta urinib ko'ring."
+        )
+        return
+
+    if mode == "auto":
+        latin = len(_LATIN_LETTER_RE.findall(text))
+        cyr = len(_CYRILLIC_LETTER_RE.findall(text))
+        mode = "l2c" if latin >= cyr else "c2l"
+
+    # OCR matni oddiy matn: HTML belgilarini himoyalab, o'giramiz
+    converted_html = transliterate(esc(text), mode)
+    converted_plain = html_lib.unescape(converted_html)
+    mode_name = USER_MODE_INFO.get(mode, mode)
+    suffix = f"\n\n<i>{esc(note)}</i>" if note else ""
+
+    if len(converted_plain) <= SHORT_RESULT_LEN:
+        await message.answer(converted_html + suffix, reply_markup=MENU_KB)
+    else:
+        await message.answer_document(
+            BufferedInputFile(converted_plain.encode("utf-8"), filename="natija.txt"),
+            caption=f"✅ Tayyor ({mode_name}). Matn uzun bo'lgani uchun fayl sifatida yuborildi."
+            + (f"\n{note}" if note else ""),
+        )
 
 
 # ---------- Kanal postlariga avtomatik izoh qo'shish ----------
