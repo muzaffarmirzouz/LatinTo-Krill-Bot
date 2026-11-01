@@ -185,7 +185,7 @@ async def _owned_channel(callback: CallbackQuery, part: int = 1):
     return channel_id, title
 
 
-async def notify_owner(channel_id: int, text: str) -> None:
+async def notify_owner(channel_id: int, text: str, reply_markup=None) -> None:
     """Kanal egasiga shaxsiy xabar (soatiga ko'pi bilan bir marta)."""
     now = time.monotonic()
     if now - _last_notified.get(channel_id, -NOTIFY_COOLDOWN) < NOTIFY_COOLDOWN:
@@ -195,7 +195,7 @@ async def notify_owner(channel_id: int, text: str) -> None:
         return
     _last_notified[channel_id] = now
     try:
-        await bot.send_message(owner_id, text)
+        await bot.send_message(owner_id, text, reply_markup=reply_markup)
     except TelegramAPIError as e:
         logging.warning("Egaga (%s) xabar yuborib bo'lmadi: %s", owner_id, e)
 
@@ -213,16 +213,52 @@ SUBSCRIBE_KEYBOARD = InlineKeyboardMarkup(
 )
 
 
-async def _is_subscribed(user_id: int) -> "bool | None":
-    """True/False — aniq natija. None — tekshirib bo'lmadi (fail-open)."""
+_sub_cache: dict[int, tuple[bool, float]] = {}
+SUB_TTL_YES = 600  # obuna bo'lganlar 10 daqiqa eslab qolinadi (Telegram'ga har safar so'ramaymiz)
+SUB_TTL_NO = 30    # obuna bo'lmaganlar 30 soniya — obuna bo'lsa tez aniqlansin
+
+
+async def _is_subscribed(user_id: int, fresh: bool = False) -> "bool | None":
+    """True/False — aniq natija. None — tekshirib bo'lmadi (fail-open).
+    fresh=True — keshni o'tkazib yuborib, Telegram'dan qayta so'raydi."""
+    now = time.monotonic()
+    if not fresh:
+        hit = _sub_cache.get(user_id)
+        if hit and now - hit[1] < (SUB_TTL_YES if hit[0] else SUB_TTL_NO):
+            return hit[0]
     try:
         member = await bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return member.status in ("creator", "administrator", "member") or getattr(
-            member, "is_member", False
+        ok = bool(
+            member.status in ("creator", "administrator", "member")
+            or getattr(member, "is_member", False)
         )
     except TelegramAPIError as e:
         logging.warning("Obuna tekshiruvida xatolik (user_id=%s): %s", user_id, e)
         return None
+    if len(_sub_cache) > 20000:
+        _sub_cache.clear()
+    _sub_cache[user_id] = (ok, now)
+    return ok
+
+
+async def _owner_allowed(channel_id: int) -> bool:
+    """Kanal egasi majburiy kanalga obuna bo'lganmi? Obuna bo'lmagan eganing
+    kanalida bot ishlamaydi (egasiga bir soatda bir marta eslatma yuboriladi).
+    Egasi noma'lum, operator yoki tekshirib bo'lmasa — ruxsat (fail-open)."""
+    owner_id = db.get_channel_owner(channel_id)
+    if not owner_id or owner_id in OPERATOR_IDS:
+        return True
+    if await _is_subscribed(owner_id) is not False:
+        return True
+    logging.info("chat_id=%s: egasi (%s) obuna emas — o'tkazib yuborildi.", channel_id, owner_id)
+    await notify_owner(
+        channel_id,
+        f"⚠️ «{esc(db.get_channel_title(channel_id) or channel_id)}» kanalida bot ishi "
+        f"to'xtatildi: avval {esc(REQUIRED_CHANNEL)} kanaliga obuna bo'ling, so'ng "
+        "\"✅ Obuna bo'ldim\" tugmasini bosing. Shundan keyin bot qayta ishlaydi.",
+        reply_markup=SUBSCRIBE_KEYBOARD,
+    )
+    return False
 
 
 async def _check_subscription(user_id: int) -> bool:
@@ -251,7 +287,7 @@ async def require_subscription_callback(callback: CallbackQuery) -> bool:
 
 @dp.callback_query(F.data == "check_sub")
 async def cb_check_sub(callback: CallbackQuery):
-    if await _is_subscribed(callback.from_user.id) is False:
+    if await _is_subscribed(callback.from_user.id, fresh=True) is False:
         await callback.answer("Hali obuna bo'lmagansiz.", show_alert=True)
         return
     await callback.answer("✅ Rahmat!")
@@ -1026,6 +1062,8 @@ async def apply_text_post(message: Message) -> None:
         return
     if db.get_translit_mode(chat_id) != "new":
         return
+    if not await _owner_allowed(chat_id):
+        return
 
     base = message.html_text or ""
     source = SKIP_TAG_RE.sub("", base).strip() if SKIP_TAG_RE.search(base) else base
@@ -1059,6 +1097,8 @@ async def handle_channel_text(message: Message):
 
 async def apply_caption(chat_id: int, message_id: int, base_html: str, caption_raw: str) -> None:
     if db.get_paused(chat_id) or not db.is_active(chat_id):
+        return
+    if not await _owner_allowed(chat_id):
         return
 
     mode = db.get_translit_mode(chat_id)
@@ -1122,6 +1162,8 @@ async def apply_convert_only(chat_id: int, message_id: int, base_html: str) -> N
     if db.get_paused(chat_id) or not db.is_active(chat_id):
         return
     if db.get_translit_mode(chat_id) != "new":
+        return
+    if not await _owner_allowed(chat_id):
         return
 
     source = SKIP_TAG_RE.sub("", base_html).strip() if SKIP_TAG_RE.search(base_html) else base_html
