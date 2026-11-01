@@ -272,10 +272,51 @@ def new_alphabet_html(html: str) -> str:
     return _apply_html_transform(step1, _LAT_WORD_PATTERN, _latin_word_to_new)
 
 
+# ===================== YANGI ALIFBO -> KIRILL / LOTIN =====================
+# ş -> sh, ç -> ch, ö -> o', ğ -> g' (qolgan harflar o'zgarmagan)
+
+_NEW_TO_OLD = {
+    "ş": "sh", "Ş": "Sh", "ç": "ch", "Ç": "Ch",
+    "ö": "o'", "Ö": "O'", "ğ": "g'", "Ğ": "G'",
+}
+_NEW_LETTERS = "şŞçÇöÖğĞ"
+_NEW_LETTER_RE = re.compile("[" + _NEW_LETTERS + "]")
+# Yangi harflar ham so'zga kiradi (aks holda "şahar" bo'lakka bo'linib ketadi)
+_NEWLAT_WORD_PATTERN = re.compile(
+    r"[A-Za-z" + _NEW_LETTERS + r"]+(?:[" + _A + r"][A-Za-z" + _NEW_LETTERS + r"]+)*"
+    r"(?:(?<=[oOgG])[" + _A + r"])?"
+)
+
+
+def has_new_letters(text: str) -> bool:
+    """Matnda yangi alifboga xos harf (ş ç ö ğ) bormi."""
+    return bool(_NEW_LETTER_RE.search(text or ""))
+
+
+def _new_to_old_latin(word: str) -> str:
+    return "".join(_NEW_TO_OLD.get(ch, ch) for ch in word)
+
+
+def _new_word_to_cyr(word: str) -> str:
+    return _latin_to_cyr_word(_new_to_old_latin(word))
+
+
+def new_to_cyrillic_html(html: str) -> str:
+    """Yangi alifbo (va oddiy lotin) -> kirill. Kirill qism o'zgarishsiz qoladi."""
+    return _apply_html_transform(html, _NEWLAT_WORD_PATTERN, _new_word_to_cyr)
+
+
+def new_to_latin_html(html: str) -> str:
+    """Yangi alifbo -> eski lotin (ş->sh, ç->ch, ö->o', ğ->g')."""
+    return _apply_html_transform(html, _NEWLAT_WORD_PATTERN, _new_to_old_latin)
+
+
 TRANSLIT_MODES = {
     "l2c": ("Lotin → Kirill", latin_to_cyrillic_html),
     "c2l": ("Kirill → Lotin", cyrillic_to_latin_html),
     "new": ("Yangi alifbo (ş ç ö ğ)", new_alphabet_html),
+    "n2c": ("Yangi alifbo → Kirill", new_to_cyrillic_html),
+    "n2l": ("Yangi alifbo → Lotin", new_to_latin_html),
     "off": ("O'chirilgan", lambda html: html),
 }
 # Yangi kanallar uchun standart: post matniga tegmaslik

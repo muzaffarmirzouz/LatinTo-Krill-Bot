@@ -27,7 +27,7 @@ from aiogram.types import (
 
 import db
 from config import BOT_TOKEN, LEGACY_CHANNEL_ID, OPERATOR_IDS, REQUIRED_CHANNEL
-from transliterate import TRANSLIT_MODES, transliterate
+from transliterate import TRANSLIT_MODES, has_new_letters, transliterate
 
 logging.basicConfig(level=logging.INFO)
 
@@ -77,12 +77,18 @@ _last_notified: dict[int, float] = {}
 BTN_L2C = "🔤 Lotin → Kirill"
 BTN_C2L = "🔤 Kirill → Lotin"
 BTN_NEW = "✨ Yangi alifbo"
+BTN_N2C = "✨ Yangi → Kirill"
+BTN_N2L = "✨ Yangi → Lotin"
 BTN_AUTO = "🔄 Avto"
-USER_MODE_BUTTONS = {BTN_L2C: "l2c", BTN_C2L: "c2l", BTN_NEW: "new", BTN_AUTO: "auto"}
+USER_MODE_BUTTONS = {
+    BTN_L2C: "l2c", BTN_C2L: "c2l", BTN_NEW: "new",
+    BTN_N2C: "n2c", BTN_N2L: "n2l", BTN_AUTO: "auto",
+}
 MENU_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_L2C), KeyboardButton(text=BTN_C2L)],
-        [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_AUTO)],
+        [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_N2C)],
+        [KeyboardButton(text=BTN_N2L), KeyboardButton(text=BTN_AUTO)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Matn yuboring…",
@@ -91,7 +97,9 @@ USER_MODE_INFO = {
     "l2c": "Lotin → Kirill",
     "c2l": "Kirill → Lotin",
     "new": "Yangi alifbo (sh→ş, ch→ç, o'→ö, g'→ğ)",
-    "auto": "Avto (lotin yozsangiz kirillga, kirill yozsangiz lotinga)",
+    "n2c": "Yangi alifbo → Kirill (ş→ш, ç→ч, ö→ў, ğ→ғ)",
+    "n2l": "Yangi alifbo → Lotin (ş→sh, ç→ch, ö→o', ğ→g')",
+    "auto": "Avto (lotin yozsangiz kirillga, kirill yozsangiz lotinga, yangi harflar bo'lsa kirillga)",
 }
 
 WELCOME_TEXT = (
@@ -124,12 +132,14 @@ WELCOME_TEXT = (
     "🔤 Kirill → Lotin\n"
     "✨ Yangi alifbo — lotin yoki kirilldagi matnni yangi harflarga o'giradi: "
     "<b>sh→ş, ch→ç, o'→ö, g'→ğ</b>\n"
+    "✨ Yangi → Kirill / ✨ Yangi → Lotin — yangi alifbodagi matnni kirill yoki eski lotinga qaytaradi\n"
     "🔄 Avto — yozuvni o'zi aniqlaydi\n"
-    "Buyruqlar: /lotin_kirill, /kirill_lotin, /yangi_alifbo, /avto\n"
+    "Buyruqlar: /lotin_kirill, /kirill_lotin, /yangi_alifbo, /yangi_kirill, /yangi_lotin, /avto\n"
     "📷 Matnli <b>rasm</b>, <b>PDF</b> yoki <b>.txt</b> fayl yuborsangiz ham, matnni o'qib, "
     "tanlangan rejimda o'girib beraman.\n\n"
     "Kanalda yangi alifbo uchun /translit orqali <b>Yangi alifbo</b> rejimini tanlang — "
-    "postlardagi eski harflar avtomatik yangisiga o'zgaradi."
+    "kanalga tashlangan har bir yangi post (kirillcha ham, eski lotincha ham; matnli, "
+    "rasm, video yoki albom; izohli yoki izohsiz) avtomatik yangi harflarga o'zgaradi."
 )
 
 
@@ -284,7 +294,9 @@ async def on_my_chat_member(update: ChatMemberUpdated):
         if can_edit:
             text = (
                 f"✅ Kanal ro'yxatga olindi: <b>{esc(title)}</b>\n"
-                "Endi /setcaption orqali shu kanal uchun izoh belgilashingiz mumkin."
+                "Endi /setcaption orqali shu kanal uchun izoh belgilashingiz mumkin.\n"
+                "✨ Postlar avtomatik yangi alifboga (ş ç ö ğ) o'tishi uchun /translit orqali "
+                "«Yangi alifbo» rejimini tanlang."
             )
         else:
             text = (
@@ -363,6 +375,16 @@ async def cmd_mode_c2l(message: Message):
 @dp.message(Command("yangi_alifbo"), F.chat.type == "private")
 async def cmd_mode_new(message: Message):
     await _set_user_mode(message, "new")
+
+
+@dp.message(Command("yangi_kirill"), F.chat.type == "private")
+async def cmd_mode_n2c(message: Message):
+    await _set_user_mode(message, "n2c")
+
+
+@dp.message(Command("yangi_lotin"), F.chat.type == "private")
+async def cmd_mode_n2l(message: Message):
+    await _set_user_mode(message, "n2l")
 
 
 @dp.message(Command("avto"), F.chat.type == "private")
@@ -738,21 +760,31 @@ def _split_text(text: str, size: int = 3800) -> list[str]:
     return chunks or [""]
 
 
+def _detect_mode(text: str) -> str:
+    """'Avto' rejim: yangi harflar (ş ç ö ğ) bo'lsa — kirillga; aks holda
+    lotin bo'lsa kirillga, kirill bo'lsa lotinga."""
+    if has_new_letters(text):
+        return "n2c"
+    latin = len(_LATIN_LETTER_RE.findall(text))
+    cyr = len(_CYRILLIC_LETTER_RE.findall(text))
+    return "l2c" if latin >= cyr else "c2l"
+
+
 @dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def echo_translit(message: Message):
-    """Botga yozilgan istalgan matnni yo'nalishini avtomatik aniqlab o'giradi."""
+    """Botga yozilgan istalgan matnni tanlangan (yoki avto aniqlangan) rejimda o'giradi."""
     if not await require_subscription_message(message):
         return
 
     raw_text = message.text or ""
     latin_count = len(_LATIN_LETTER_RE.findall(raw_text))
     cyrillic_count = len(_CYRILLIC_LETTER_RE.findall(raw_text))
-    if latin_count == 0 and cyrillic_count == 0:
+    if latin_count == 0 and cyrillic_count == 0 and not has_new_letters(raw_text):
         return
 
     mode = db.get_user_mode(message.from_user.id)
     if mode == "auto":
-        mode = "l2c" if latin_count >= cyrillic_count else "c2l"
+        mode = _detect_mode(raw_text)
 
     source = message.html_text or raw_text
     result = transliterate(source, mode)
@@ -922,9 +954,7 @@ async def on_file_to_text(message: Message):
         return
 
     if mode == "auto":
-        latin = len(_LATIN_LETTER_RE.findall(text))
-        cyr = len(_CYRILLIC_LETTER_RE.findall(text))
-        mode = "l2c" if latin >= cyr else "c2l"
+        mode = _detect_mode(text)
 
     db.bump_counter("files")
     # OCR matni oddiy matn: HTML belgilarini himoyalab, o'giramiz
@@ -1085,11 +1115,41 @@ async def apply_caption(chat_id: int, message_id: int, base_html: str, caption_r
     )
 
 
+async def apply_convert_only(chat_id: int, message_id: int, base_html: str) -> None:
+    """Kanalda izoh belgilanmagan bo'lsa ham, 'Yangi alifbo' rejimida media
+    postning o'z matnini (kirill yoki eski lotin) yangi alifboga o'zgartiradi.
+    Boshqa rejimlarda izohsiz postlarga tegilmaydi."""
+    if db.get_paused(chat_id) or not db.is_active(chat_id):
+        return
+    if db.get_translit_mode(chat_id) != "new":
+        return
+
+    source = SKIP_TAG_RE.sub("", base_html).strip() if SKIP_TAG_RE.search(base_html) else base_html
+    new_caption = transliterate(source, "new")
+    if new_caption == base_html:
+        return
+    if plain_len(new_caption) > MAX_CAPTION_LEN:
+        return
+
+    err = await _edit_caption(chat_id, message_id, new_caption)
+    if err is None:
+        db.log_caption_applied(chat_id)
+        return
+    logging.error("Media matnini o'zgartirib bo'lmadi: chat_id=%s, xato=%s", chat_id, err)
+    await notify_owner(
+        chat_id,
+        f"⚠️ «{esc(db.get_channel_title(chat_id) or chat_id)}» kanalidagi postni yangi alifboga "
+        f"o'zgartirib bo'lmadi.\nSabab: <code>{esc(err)}</code>\n"
+        "Botda <b>\"Xabarlarni tahrirlash\" (Edit Messages)</b> huquqi yoqilganini tekshiring.",
+    )
+
+
 @dp.channel_post(~F.media_group_id, MEDIA_FILTER)
 async def handle_channel_post(message: Message):
     """Yakka (albom bo'lmagan) media postlari."""
     caption_text = db.get_caption(message.chat.id)
     if not caption_text:
+        await apply_convert_only(message.chat.id, message.message_id, message.html_text or "")
         return
     await apply_caption(message.chat.id, message.message_id, message.html_text or "", caption_text)
 
@@ -1127,13 +1187,17 @@ async def process_album(group_id: str) -> None:
         return
 
     chat_id = messages[0].chat.id
+    messages.sort(key=lambda m: m.message_id)
     caption_text = db.get_caption(chat_id)
     if not caption_text:
+        # Izoh yo'q: 'Yangi alifbo' rejimida albomning matnli elementlari o'zgartiriladi
+        for m in messages:
+            if (m.html_text or "").strip():
+                await apply_convert_only(chat_id, m.message_id, m.html_text or "")
         return
 
     # Telegram butun albom uchun faqat BITTA izohni ko'rsatadi — asl izohi
     # bor elementni tanlaymiz, bo'lmasa birinchisini
-    messages.sort(key=lambda m: m.message_id)
     target = next((m for m in messages if (m.html_text or "").strip()), messages[0])
     await apply_caption(chat_id, target.message_id, target.html_text or "", caption_text)
 
